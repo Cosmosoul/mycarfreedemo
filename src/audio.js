@@ -1,496 +1,182 @@
 /* ============================================================
-   audio.js —— 音频系统
-   1. AudioContext / Gain 节点
-   2. SFX（音效 + 门控限流）
-   3. Engine（8bit 引擎声浪）
-   4. BGM（多曲目调度 + 淡入淡出）
+   config.js —— 所有数值 / 关卡 / 解锁规则 / 进度存档
+   修改游戏手感、难度曲线、解锁条件 → 只改这里
    ============================================================ */
 
-import { state, player, isEngineEnabled } from '@/core.js';
-import { keys } from '@/platform.js';
-import { V } from '@/content/vehicles.js';
-import {
-  BGM_TRACKS, GAME_TRACK_ROTATION,
-} from '@/content/music.js';
+import { loadJSON, saveJSON } from '@/platform.js';
+import { getLang, T } from '@/i18n.js';
 
 /* ============================================================
-   1. AudioContext / Gain
+   1. Tuning —— 全局可调数值
    ============================================================ */
-let audioCtx = null;
-let sfxGain = null;
-let musicGain = null;
-let bgmGain = null;
-
-export function initAudio() {
-  if (!audioCtx) {
-    try {
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    } catch (e) {}
-  }
-  if (audioCtx && !sfxGain) {
-    sfxGain = audioCtx.createGain();
-    sfxGain.gain.value = state.soundOn ? state.sfxVolume : 0;
-    sfxGain.connect(audioCtx.destination);
-
-    musicGain = audioCtx.createGain();
-    musicGain.gain.value = state.musicOn ? state.musicVolume * 0.22 : 0;
-    musicGain.connect(audioCtx.destination);
-
-    bgmGain = audioCtx.createGain();
-    bgmGain.gain.value = 1.0;
-    bgmGain.connect(musicGain);
-  }
-  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
-}
-
-export function getAudioCtx()  { return audioCtx; }
-export function getSfxGain()   { return sfxGain; }
-export function getMusicGain() { return musicGain; }
-export function getBgmGain()   { return bgmGain; }
-
-/* 音量变化后刷新节点（供 ui/menus 调用） */
-export function refreshVolumes() {
-  if (sfxGain)   sfxGain.gain.value   = state.soundOn ? state.sfxVolume : 0;
-  if (musicGain) musicGain.gain.value = state.musicOn ? state.musicVolume * 0.22 : 0;
-}
-
-/* ============================================================
-   2. SFX —— 音效 + 门控限流
-   ============================================================ */
-const _sfxHistory = new Map();
-const SFX_WINDOW_MS = 300;
-const SFX_MAX_PER_WINDOW = 5;
-
-function sfxGate(name) {
-  const now = performance.now();
-  let arr = _sfxHistory.get(name);
-  if (!arr) { arr = []; _sfxHistory.set(name, arr); }
-  while (arr.length && now - arr[0] >= SFX_WINDOW_MS) arr.shift();
-  if (arr.length >= SFX_MAX_PER_WINDOW) return false;
-  arr.push(now);
-  return true;
-}
-
-/* ★ 已导出：供 systems/gameplay.js 的 doJump 使用 */
-export function playTone(freq, duration, type = 'square', volume = 0.08) {
-  if (!state.soundOn || !audioCtx || !sfxGain) return;
-  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
-  o.type = type; o.frequency.value = freq;
-  g.gain.setValueAtTime(volume, audioCtx.currentTime);
-  g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
-  o.connect(g); g.connect(sfxGain);
-  o.start(); o.stop(audioCtx.currentTime + duration);
-}
-
-function playNoise(duration, volume = 0.1, filterFreq = 2000) {
-  if (!state.soundOn || !audioCtx || !sfxGain) return;
-  const bs = audioCtx.sampleRate * duration;
-  const buffer = audioCtx.createBuffer(1, bs, audioCtx.sampleRate);
-  const data = buffer.getChannelData(0);
-  for (let i = 0; i < bs; i++) data[i] = Math.random() * 2 - 1;
-  const src = audioCtx.createBufferSource(); src.buffer = buffer;
-  const filter = audioCtx.createBiquadFilter(); filter.type = 'lowpass'; filter.frequency.value = filterFreq;
-  const g = audioCtx.createGain();
-  g.gain.setValueAtTime(volume, audioCtx.currentTime);
-  g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
-  src.connect(filter); filter.connect(g); g.connect(sfxGain);
-  src.start(); src.stop(audioCtx.currentTime + duration);
-}
-
-function playSweep(f1, f2, d, t = 'square', v = 0.08) {
-  if (!state.soundOn || !audioCtx || !sfxGain) return;
-  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
-  o.type = t;
-  o.frequency.setValueAtTime(f1, audioCtx.currentTime);
-  o.frequency.exponentialRampToValueAtTime(f2, audioCtx.currentTime + d);
-  g.gain.setValueAtTime(v, audioCtx.currentTime);
-  g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + d);
-  o.connect(g); g.connect(sfxGain);
-  o.start(); o.stop(audioCtx.currentTime + d);
-}
-
-/* ---------- 具体音效 ---------- */
-export function sfxBasic()       { if (!sfxGate('basic')) return; playTone(1400, 0.03, 'square', 0.025); playTone(1800, 0.02, 'square', 0.018); }
-export function sfxAoe()         { if (!sfxGate('aoe')) return; playSweep(300, 80, 0.2, 'square', 0.06); playNoise(0.22, 0.06, 900); }
-export function sfxShock()       { if (!sfxGate('shock')) return; playTone(220, 0.1, 'square', 0.05); playTone(165, 0.16, 'square', 0.05); playTone(110, 0.22, 'triangle', 0.05); }
-export function sfxHeal()        { if (!sfxGate('heal')) return; playTone(523, 0.06, 'square', 0.045); setTimeout(() => playTone(659, 0.06, 'square', 0.045), 55); setTimeout(() => playTone(784, 0.1, 'square', 0.05), 110); }
-export function sfxCrit()        { if (!sfxGate('crit')) return; playTone(1800, 0.04, 'square', 0.05); setTimeout(() => playTone(2600, 0.05, 'square', 0.045), 25); }
-export function sfxExecute()     { if (!sfxGate('execute')) return; playSweep(1200, 200, 0.2, 'sawtooth', 0.055); playTone(80, 0.1, 'sine', 0.06); }
-export function sfxLuck()        { if (!sfxGate('luck')) return; playTone(1320, 0.08, 'triangle', 0.045); playTone(1760, 0.1, 'triangle', 0.04); }
-export function sfxThunder()     { if (!sfxGate('thunder')) return; playNoise(0.5, 0.15, 1000); playSweep(90, 40, 0.5, 'sawtooth', 0.13); playTone(2000, 0.1, 'square', 0.03); }
-export function sfxChain()       { if (!sfxGate('chain')) return; playTone(1400, 0.025, 'square', 0.035); setTimeout(() => playTone(1100, 0.025, 'square', 0.032), 20); setTimeout(() => playTone(1700, 0.035, 'square', 0.03), 42); }
-export function sfxFreeze()      { if (!sfxGate('freeze')) return; playTone(2400, 0.08, 'sine', 0.04); playTone(3200, 0.06, 'sine', 0.028); }
-export function sfxEnergy()      { if (!sfxGate('energy')) return; playTone(1200, 0.04, 'square', 0.04); setTimeout(() => playTone(1800, 0.08, 'square', 0.045), 45); }
-export function sfxHealCard()    { if (!sfxGate('healcard')) return; playTone(440, 0.08, 'sine', 0.05); setTimeout(() => playTone(554, 0.08, 'sine', 0.05), 55); setTimeout(() => playTone(659, 0.14, 'sine', 0.055), 110); }
-export function sfxRam()         { if (!sfxGate('ram')) return; playSweep(320, 100, 0.12, 'square', 0.09); playNoise(0.14, 0.08, 1400); playTone(90, 0.15, 'sawtooth', 0.06); }
-export function sfxKill()        { if (!sfxGate('kill')) return; playTone(400 + Math.random() * 150, 0.055, 'square', 0.04); }
-export function sfxHurt()        { if (!sfxGate('hurt')) return; playSweep(400, 120, 0.14, 'sawtooth', 0.07); }
-export function sfxCardSelect()  { if (!sfxGate('cardselect')) return; playTone(800, 0.1, 'sine', 0.07); setTimeout(() => playTone(1200, 0.14, 'sine', 0.06), 80); }
-export function sfxCardPick()    { if (!sfxGate('cardpick')) return; playTone(600, 0.08, 'square', 0.06); setTimeout(() => playTone(900, 0.08, 'square', 0.06), 50); setTimeout(() => playTone(1350, 0.16, 'square', 0.06), 100); }
-export function sfxGameOver()    { if (!sfxGate('gameover')) return; playSweep(400, 100, 0.6, 'sawtooth', 0.12); setTimeout(() => playSweep(300, 60, 0.8, 'square', 0.1), 200); setTimeout(() => playTone(50, 1.2, 'sine', 0.13), 400); }
-export function sfxVictory()     { if (!sfxGate('victory')) return; playTone(523, 0.12, 'square', 0.08); setTimeout(() => playTone(659, 0.12, 'square', 0.08), 120); setTimeout(() => playTone(784, 0.12, 'square', 0.08), 240); setTimeout(() => playTone(1047, 0.24, 'square', 0.09), 360); setTimeout(() => playTone(1319, 0.32, 'triangle', 0.08), 540); }
-export function sfxBossSpawn()   { if (!sfxGate('bossspawn')) return; playSweep(60, 160, 0.6, 'sawtooth', 0.14); playSweep(120, 40, 0.8, 'square', 0.1); }
-export function sfxDodge()       { if (!sfxGate('dodge')) return; playSweep(900, 1800, 0.12, 'square', 0.06); playNoise(0.1, 0.04, 3000); }
-export function sfxZombieGroan() { if (!sfxGate('groan')) return; playSweep(180 + Math.random() * 60, 80, 0.5, 'sawtooth', 0.03); }
-export function sfxZombieAttack(){ if (!sfxGate('zattack')) return; playSweep(300, 150, 0.15, 'sawtooth', 0.045); playNoise(0.12, 0.035, 1800); }
-export function sfxSmash()       { if (!sfxGate('smash')) return; playSweep(180, 60, 0.18, 'sawtooth', 0.09); playNoise(0.18, 0.1, 800); }
-export function sfxUI()          { if (!sfxGate('ui')) return; playTone(700, 0.05, 'triangle', 0.035); }
-
-/* ============================================================
-   3. Engine —— 8bit 引擎声浪
-   ============================================================ */
-const Engine = {
-  running: false,
-  master: null, filter: null,
-  osc: [], oscGain: [],
-  noiseSrc: null, noiseFilter: null, noiseGain: null,
-  acc: 0,
+const Tuning = {
+  Dodge:  { dashDistance: 8, dashDuration: 0.15, iframes: 0.3, cooldown: 0.3 },
+  Jump:   { height: 1.6, duration: 0.42, airInvuln: 0.42, airStompRange: 7, airStompDamage: 30, cooldown: 0.3 },
+  Ram: {
+    invuln: 0.18, cooldownPerEnemy: 0.35,
+    knockImpulse: 40, knockSpeedBonus: 60, knockUpward: 20,
+    bossKnockImpulse: 7, bossKnockUpward: 2.5, bossKnockTime: 0.4,
+    hitStopDuration: 0.02, hitStopScale: 0.4, fovKick: 6,
+  },
+  Points: { initialCap: 100, perKill: 10, perElite: 30, perBoss: 100, capGrowth: 1.35 },
+  Wave: {
+    baseCount: 30, growthPerWave: 1.20, onScreenCap: 400,
+    spawnRate: 120, waveDuration: 50, clearWaveDelay: 0.6, bossEvery: 4,
+    spawnRadiusMin: 20, spawnRadiusMax: 50,
+  },
+  AI: {
+    flankRatio: 0.35, rearRatio: 0.20, separationWeight: 1.5,
+    prediction: 0.5, flankAngle: 2.2, rearAngle: 0.4, orbitSpeed: 0.5,
+  },
+  Physics:   { gravity: 60, airDrag: 0.4 },
+  Particles: { count: 18, bossCount: 60, speed: 14, gravity: 70, life: 0.85 },
+  Terrain:   { treeCount: 80, lampSpacing: 25, destructDestroySpeed: 4, grassCount: 2400 },
+  SpeedFx: {
+    threshold: 0.70, fullAt: 0.95,
+    riseRate: 9.0, fallRate: 10.0, fovBoost: 7.0,
+    lineCount: 56, emitRate: 150, emitRateGain: 430, maxFlames: 600,
+  },
 };
 
-export function startEngineSound() {
-  if (Engine.running || !audioCtx || !sfxGain) return;
-  const ctx = audioCtx;
-  const now = ctx.currentTime;
+export default Tuning;
 
-  Engine.master = ctx.createGain();
-  Engine.master.gain.value = 0;
-  Engine.master.connect(sfxGain);
+/* ============================================================
+   2. 关卡数据
+   ============================================================ */
+export const LEVELS = [
+  { name: '新手试炼', waves: 2,  mult: 1.0, elite: false, times: [45, 70, 100] },
+  { name: '荒野初探', waves: 3,  mult: 1.0, elite: false, times: [70, 100, 140] },
+  { name: '车流涌动', waves: 4,  mult: 1.0, elite: false, times: [95, 135, 180] },
+  { name: '尸潮来袭', waves: 5,  mult: 1.0, elite: false, times: [120, 165, 220] },
+  { name: '钢铁洪流', waves: 6,  mult: 1.0, elite: false, times: [145, 200, 260] },
+  { name: '加重压力', waves: 2,  mult: 1.5, elite: false, times: [55, 85, 120] },
+  { name: '层层逼近', waves: 3,  mult: 1.5, elite: false, times: [80, 120, 165] },
+  { name: '血肉之墙', waves: 4,  mult: 1.5, elite: false, times: [110, 155, 205] },
+  { name: '绝境求生', waves: 5,  mult: 1.5, elite: false, times: [140, 195, 255] },
+  { name: '狂潮',     waves: 6,  mult: 1.5, elite: false, times: [170, 235, 300] },
+  { name: '精准打击', waves: 2,  mult: 1.5, elite: true,  times: [70, 105, 145] },
+  { name: '铁壁铜墙', waves: 3,  mult: 1.5, elite: true,  times: [100, 145, 195] },
+  { name: '暗流涌动', waves: 4,  mult: 1.5, elite: true,  times: [135, 190, 250] },
+  { name: '地狱之路', waves: 5,  mult: 1.5, elite: true,  times: [170, 230, 300] },
+  { name: '钢铁炼狱', waves: 6,  mult: 1.5, elite: true,  times: [210, 280, 360] },
+  { name: '无限模式', waves: Infinity, mult: 1.0, elite: false, times: null },
+];
 
-  Engine.filter = ctx.createBiquadFilter();
-  Engine.filter.type = 'lowpass';
-  Engine.filter.frequency.value = 600;
-  Engine.filter.Q.value = 2.4;
-  Engine.filter.connect(Engine.master);
+const LEVEL_NAMES = {
+  zh: ['新手试炼','荒野初探','车流涌动','尸潮来袭','钢铁洪流','加重压力','层层逼近','血肉之墙','绝境求生','狂潮','精准打击','铁壁铜墙','暗流涌动','地狱之路','钢铁炼狱','无限模式'],
+  en: ['Novice Trial','Into the Wild','Traffic Surge','Horde Incoming','Steel Tide','Rising Pressure','Closing In','Wall of Flesh','Desperate Survival','Frenzy','Precision Strike','Iron Wall','Undercurrent','Road to Hell','Steel Purgatory','Endless Mode'],
+};
 
-  const shapes = ['square', 'sawtooth', 'square'];
-  const gains  = [0.50, 0.34, 0.10];
-  const mults  = [1, 0.5, 2.02];
-
-  Engine.osc = []; Engine.oscGain = [];
-  for (let i = 0; i < 3; i++) {
-    const o = ctx.createOscillator();
-    o.type = shapes[i];
-    o.frequency.value = 60 * mults[i];
-    const g = ctx.createGain();
-    g.gain.value = gains[i];
-    o.connect(g); g.connect(Engine.filter);
-    o.start(now);
-    Engine.osc.push(o);
-    Engine.oscGain.push(g);
-  }
-
-  const len = Math.floor(ctx.sampleRate * 0.8);
-  const buf = ctx.createBuffer(1, len, ctx.sampleRate);
-  const data = buf.getChannelData(0);
-  for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
-  const src = ctx.createBufferSource();
-  src.buffer = buf; src.loop = true;
-
-  Engine.noiseFilter = ctx.createBiquadFilter();
-  Engine.noiseFilter.type = 'bandpass';
-  Engine.noiseFilter.frequency.value = 220;
-  Engine.noiseFilter.Q.value = 0.9;
-
-  Engine.noiseGain = ctx.createGain();
-  Engine.noiseGain.gain.value = 0.22;
-
-  src.connect(Engine.noiseFilter);
-  Engine.noiseFilter.connect(Engine.noiseGain);
-  Engine.noiseGain.connect(Engine.master);
-  src.start(now);
-  Engine.noiseSrc = src;
-
-  Engine.running = true;
+export function getLevelName(id) {
+  const arr = LEVEL_NAMES[getLang()] || LEVEL_NAMES.en;
+  return arr[id - 1] || LEVEL_NAMES.en[id - 1] || '';
 }
 
-export function updateEngineSound(dt) {
-  if (!Engine.running || !audioCtx) return;
-  Engine.acc += dt;
-  if (Engine.acc < 0.033) return;
-  Engine.acc = 0;
-
-  const ctx = audioCtx;
-  const t = ctx.currentTime;
-  const C = V();
-
-  const spd = player.speed;
-  const rev = spd < -0.5;
-  const ratio = Math.min(1, Math.abs(spd) / Math.max(1, C.maxSpeed));
-  const rpm = Math.pow(ratio, 0.85);
-
-  const baseFreq = rev ? (38 + rpm * 72) : (52 + rpm * 164);
-  const cutoff   = rev ? (240 + ratio * 900) : (420 + ratio * 3000);
-  const qVal     = rev ? 5.5 : 2.4;
-
-  Engine.osc[0].frequency.setTargetAtTime(baseFreq, t, 0.05);
-  Engine.osc[1].frequency.setTargetAtTime(baseFreq * 0.5, t, 0.06);
-  Engine.osc[2].frequency.setTargetAtTime(baseFreq * 2.02, t, 0.05);
-
-  Engine.filter.frequency.setTargetAtTime(cutoff, t, 0.08);
-  Engine.filter.Q.setTargetAtTime(qVal, t, 0.12);
-
-  Engine.noiseFilter.frequency.setTargetAtTime(Math.max(80, baseFreq * 3.2), t, 0.07);
-  Engine.noiseGain.gain.setTargetAtTime(rev ? 0.34 : (0.20 + ratio * 0.28), t, 0.10);
-
-  const throttleOn = !!(keys['KeyW'] || keys['ArrowUp'] || _touchThrottle);
-  const brakeOn    = !!(keys['KeyS'] || keys['ArrowDown'] || _touchBrake);
-
-  let vol = 0;
-  if (state.phase === 'playing' && isEngineEnabled()) {
-    if (rev) {
-      vol = 0.017 + ratio * 0.030;
-    } else {
-      vol = 0.013 + ratio * 0.048 + (throttleOn ? 0.010 : 0);
-      if (brakeOn) vol *= 0.85;
-    }
+export function getLevelRewardText(id) {
+  const parts = [];
+  if (id === 16) {
+    parts.push(T('unlockByWave'));
+  } else {
+    if (id < 15) parts.push(T('unlockNext'));
+    else if (id === 15) parts.push(T('unlockEndless'));
+    if (id === 5)  parts.push(T('unlockMotorcycle'));
   }
-  Engine.master.gain.setTargetAtTime(vol, t, 0.07);
-}
-
-/* 触屏状态由 gameplay 层注入，避免 audio 直接 import 输入模块 */
-let _touchThrottle = false;
-let _touchBrake = false;
-export function setTouchPedals(throttle, brake) {
-  _touchThrottle = !!throttle;
-  _touchBrake = !!brake;
+  return parts.join(getLang() === 'zh' ? '　+　' : '  +  ');
 }
 
 /* ============================================================
-   4. BGM —— 多曲目调度器
+   3. 进度存档
    ============================================================ */
-let musicRunning = false;
-let musicTimerHandle = null;
-let musicStep = 0;
-let nextNoteTime = 0;
-let activeTrack = null;
-let bgmTransitionToken = 0;
-let bgmPausedState = false;
-let lastGameTrackIndex = -1;
+export let progress = loadJSON('myCarProgress', {});
 
-export function getActiveTrack() { return activeTrack; }
-export function isMusicRunning() { return musicRunning; }
-export function isBgmPaused() { return bgmPausedState; }
-export function getMusicStep() { return musicStep; }
+export function saveProgress() {
+  saveJSON('myCarProgress', progress);
+}
 
-export function startBGM(trackName) {
-  if (!audioCtx || !musicGain || !bgmGain) return;
-  if (!state.musicOn) return;
-  if (activeTrack === trackName && musicRunning) return;
+export function isLevelUnlocked(id) {
+  if (id === 1) return true;
+  if (id === 16) return true;
+  return !!(progress[id] && progress[id].unlocked === true);
+}
 
-  bgmTransitionToken++;
-  const myToken = bgmTransitionToken;
+export function getLevelStars(id) {
+  return (progress[id] && progress[id].stars) || 0;
+}
 
-  if (musicRunning) {
-    const now = audioCtx.currentTime;
-    bgmGain.gain.cancelScheduledValues(now);
-    bgmGain.gain.setValueAtTime(bgmGain.gain.value, now);
-    bgmGain.gain.linearRampToValueAtTime(0, now + 0.2);
-    setTimeout(() => {
-      if (myToken !== bgmTransitionToken) return;
-      musicRunning = false;
-      if (musicTimerHandle) { clearInterval(musicTimerHandle); musicTimerHandle = null; }
-      beginTrack(trackName, myToken);
-    }, 220);
-  } else {
-    beginTrack(trackName, myToken);
+export function isLevelCleared(id) {
+  if (progress.cleared && progress.cleared[id]) return true;
+  if (progress[id] && progress[id].stars > 0) return true;
+  if (id < 16 && progress[id + 1] && progress[id + 1].unlocked) return true;
+  return false;
+}
+
+export function saveLevelResult(id, stars, time) {
+  if (!progress[id]) progress[id] = { unlocked: true, stars: 0, bestTime: Infinity };
+  progress[id].stars = Math.max(progress[id].stars, stars);
+  if (time < progress[id].bestTime) progress[id].bestTime = time;
+  if (!progress.cleared) progress.cleared = {};
+  progress.cleared[id] = true;
+  const nextId = id + 1;
+  if (nextId <= 16) {
+    if (!progress[nextId]) progress[nextId] = { unlocked: false, stars: 0, bestTime: Infinity };
+    progress[nextId].unlocked = true;
   }
+  saveProgress();
 }
 
-function beginTrack(trackName, token) {
-  if (token !== bgmTransitionToken) return;
-  if (musicTimerHandle) { clearInterval(musicTimerHandle); musicTimerHandle = null; }
-  activeTrack = trackName;
-  musicStep = 0;
-  nextNoteTime = audioCtx.currentTime + 0.08;
-  musicRunning = true;
-  bgmPausedState = false;
-  musicTimerHandle = setInterval(musicScheduler, 25);
-  const t = audioCtx.currentTime;
-  bgmGain.gain.cancelScheduledValues(t);
-  bgmGain.gain.setValueAtTime(0, t);
-  bgmGain.gain.linearRampToValueAtTime(1, t + 0.4);
+/* ============================================================
+   4. 车辆解锁规则
+   —— 车辆数值在 content/vehicles.js，这里只负责「是否解锁」
+   ============================================================ */
+export const CAR_UNLOCK_RULES = {
+  coupe:      { textKey: 'carUnlockDefault' },
+  motorcycle: { textKey: 'carUnlockMotorcycle', check: () => isLevelCleared(5) },
+  siege:      { textKey: 'carUnlockSiege',      check: () => (progress.infiniteBest || 0) >= 22 },
+};
+
+export function isVehicleUnlocked(id) {
+  if (id === 'coupe') return true;
+  const rule = CAR_UNLOCK_RULES[id];
+  if (!rule || !rule.check) return false;
+  return rule.check();
 }
 
-export function stopBGM(immediate) {
-  bgmTransitionToken++;
-  const myToken = bgmTransitionToken;
-  bgmPausedState = false;
-
-  const hardStop = () => {
-    musicRunning = false;
-    if (musicTimerHandle) { clearInterval(musicTimerHandle); musicTimerHandle = null; }
-    activeTrack = null;
-  };
-  if (immediate) hardStop();
-
-  if (!audioCtx || !bgmGain) { if (!immediate) hardStop(); return; }
-  const now = audioCtx.currentTime;
-  bgmGain.gain.cancelScheduledValues(now);
-  bgmGain.gain.setValueAtTime(bgmGain.gain.value, now);
-  bgmGain.gain.linearRampToValueAtTime(0, now + 0.2);
-  if (immediate) return;
-
-  setTimeout(() => {
-    if (myToken !== bgmTransitionToken) return;
-    hardStop();
-  }, 220);
-}
-
-export function pauseBGM() {
-  if (!audioCtx || !bgmGain || !musicRunning) return;
-  bgmTransitionToken++;
-  const now = audioCtx.currentTime;
-  bgmGain.gain.cancelScheduledValues(now);
-  bgmGain.gain.setValueAtTime(bgmGain.gain.value, now);
-  bgmGain.gain.linearRampToValueAtTime(0, now + 0.14);
-  musicRunning = false;
-  if (musicTimerHandle) { clearInterval(musicTimerHandle); musicTimerHandle = null; }
-  bgmPausedState = true;
-}
-
-export function resumeBGM() {
-  if (!audioCtx || !bgmGain || !activeTrack) { bgmPausedState = false; return; }
-  if (musicRunning) return;
-  bgmPausedState = false;
-  musicRunning = true;
-  nextNoteTime = audioCtx.currentTime + 0.06;
-  musicTimerHandle = setInterval(musicScheduler, 25);
-  const t = audioCtx.currentTime;
-  bgmGain.gain.cancelScheduledValues(t);
-  bgmGain.gain.setValueAtTime(0, t);
-  bgmGain.gain.linearRampToValueAtTime(1, t + 0.22);
-}
-
-export function pickRandomGameTrack() {
-  if (GAME_TRACK_ROTATION.length <= 1) return GAME_TRACK_ROTATION[0];
-  let idx = Math.floor(Math.random() * GAME_TRACK_ROTATION.length);
-  if (idx === lastGameTrackIndex) idx = (idx + 1) % GAME_TRACK_ROTATION.length;
-  lastGameTrackIndex = idx;
-  return GAME_TRACK_ROTATION[idx];
-}
-
-function musicScheduler() {
-  if (!musicRunning || !audioCtx || !musicGain || !activeTrack) return;
-  const track = BGM_TRACKS[activeTrack];
-  if (!track) return;
-  const sixteenth = 60 / track.bpm / 4;
-  const totalSteps = 64;
-  while (nextNoteTime < audioCtx.currentTime + 0.1) {
-    scheduleMusicStep(track, musicStep, nextNoteTime, sixteenth);
-    nextNoteTime += sixteenth;
-    musicStep = (musicStep + 1) % totalSteps;
+/* 无限模式通关达到新波次后，检查是否有新解锁车辆 */
+export function getNewlyUnlockedCars() {
+  const out = [];
+  if (!progress.cars) progress.cars = {};
+  for (const id of Object.keys(CAR_UNLOCK_RULES)) {
+    if (id === 'coupe') continue;
+    if (isVehicleUnlocked(id) && !progress.cars[id]) {
+      progress.cars[id] = true;
+      out.push(id);
+    }
   }
+  if (out.length) saveProgress();
+  return out;
 }
 
-function scheduleMusicStep(track, step, time, sixteenth) {
-  const mel = track.melody[step];
-  if (mel !== null && mel !== undefined) {
-    const lenMul = track.drums === 'psychedelic' ? 2.4
-                 : track.drums === 'airy'        ? 2.0
-                 : 1.6;
-    musicNote(mel, time, sixteenth * lenMul, 'square', 0.05);
+/* 启动时回填一次（玩家在旧版本已达成条件但未记录） */
+(function backfillCarUnlocks() {
+  let changed = false;
+  if (!progress.cars) progress.cars = {};
+  for (const id of Object.keys(CAR_UNLOCK_RULES)) {
+    if (id === 'coupe') continue;
+    if (isVehicleUnlocked(id) && !progress.cars[id]) {
+      progress.cars[id] = true;
+      changed = true;
+    }
   }
-  if (step % 4 === 0) musicNote(track.bass[(step / 4) % 16], time, sixteenth * 3.6, 'triangle', 0.09);
+  if (changed) saveProgress();
+})();
 
-  const d = track.drums;
-  if (d === 'soft') {
-    if (step % 8 === 0) musicKick(time);
-    if (step % 4 === 0) musicHat(time);
-  } else if (d === 'normal') {
-    if (step % 8 === 0) musicKick(time);
-    if (step % 8 === 4) musicSnare(time);
-    if (step % 2 === 0) musicHat(time);
-  } else if (d === 'intense') {
-    if (step % 8 === 0) musicKick(time);
-    if (step % 8 === 4) musicSnare(time);
-    if (step % 2 === 0) musicHat(time);
-    if (step % 4 === 2) musicHat(time);
-  } else if (d === 'jazz') {
-    if (step % 4 === 0) musicKick(time);
-    if (step % 8 === 6) musicSnare(time);
-    if (step % 2 === 1) musicHat(time);
-    if (step % 8 === 3) musicHat(time);
-  } else if (d === 'blues') {
-    if (step % 4 === 0) musicKick(time);
-    if (step % 8 === 5) musicKick(time);
-    if (step % 4 === 2) musicSnare(time);
-    if (step % 2 === 1) musicHat(time);
-  } else if (d === 'rock') {
-    if (step % 4 === 0) musicKick(time);
-    if (step % 4 === 2 && step % 8 !== 4) musicKick(time);
-    if (step % 8 === 4) musicSnare(time);
-    if (step % 2 === 1) musicHat(time);
-  } else if (d === 'electronic') {
-    if (step % 4 === 0) musicKick(time);
-    if (step % 8 === 4) musicSnare(time);
-    if (step % 2 === 1) musicHat(time);
-    if (step % 8 === 2 || step % 8 === 6) musicHat(time);
-  } else if (d === 'soul') {
-    if (step % 4 === 0) musicKick(time);
-    if (step % 8 === 4) musicSnare(time);
-    if (step % 4 === 2) musicHat(time);
-    if (step % 16 === 11) musicSnare(time);
-  } else if (d === 'psychedelic') {
-    if (step % 8 === 0) musicKick(time);
-    if (step % 8 === 4) musicSnare(time);
-    if (step % 3 === 0) musicHat(time);
-  } else if (d === 'funk') {
-    if (step % 4 === 0) musicKick(time);
-    if (step % 8 === 3) musicKick(time);
-    if (step % 8 === 4) musicSnare(time);
-    if (step % 4 === 1 || step % 4 === 3) musicHat(time);
-    if (step % 16 === 6) musicSnare(time);
-  } else if (d === 'airy') {
-    if (step % 8 === 0) musicKick(time);
-    if (step % 16 === 8) musicSnare(time);
-    if (step % 4 === 0) musicHat(time);
+/* 无限模式记录最佳波次 */
+export function recordInfiniteBest(waves) {
+  const best = Math.max(progress.infiniteBest || 0, waves);
+  if (best !== (progress.infiniteBest || 0)) {
+    progress.infiniteBest = best;
+    saveProgress();
+    return true;
   }
-}
-
-function musicNote(f, t, d, ty, v) {
-  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
-  o.type = ty; o.frequency.value = f;
-  g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(v, t + 0.004);
-  g.gain.exponentialRampToValueAtTime(0.001, t + d);
-  o.connect(g); g.connect(bgmGain);
-  o.start(t); o.stop(t + d);
-}
-
-function musicKick(t) {
-  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
-  o.type = 'sine';
-  o.frequency.setValueAtTime(140, t);
-  o.frequency.exponentialRampToValueAtTime(40, t + 0.1);
-  g.gain.setValueAtTime(0.22, t);
-  g.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
-  o.connect(g); g.connect(bgmGain);
-  o.start(t); o.stop(t + 0.15);
-}
-
-function musicSnare(t) {
-  const bs = audioCtx.sampleRate * 0.1;
-  const buf = audioCtx.createBuffer(1, bs, audioCtx.sampleRate);
-  const d = buf.getChannelData(0);
-  for (let i = 0; i < bs; i++) d[i] = Math.random() * 2 - 1;
-  const src = audioCtx.createBufferSource(); src.buffer = buf;
-  const filter = audioCtx.createBiquadFilter(); filter.type = 'highpass'; filter.frequency.value = 1200;
-  const g = audioCtx.createGain();
-  g.gain.setValueAtTime(0.08, t);
-  g.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
-  src.connect(filter); filter.connect(g); g.connect(bgmGain);
-  src.start(t); src.stop(t + 0.1);
-}
-
-function musicHat(t) {
-  const bs = audioCtx.sampleRate * 0.03;
-  const buf = audioCtx.createBuffer(1, bs, audioCtx.sampleRate);
-  const d = buf.getChannelData(0);
-  for (let i = 0; i < bs; i++) d[i] = Math.random() * 2 - 1;
-  const src = audioCtx.createBufferSource(); src.buffer = buf;
-  const filter = audioCtx.createBiquadFilter(); filter.type = 'highpass'; filter.frequency.value = 7000;
-  const g = audioCtx.createGain();
-  g.gain.setValueAtTime(0.028, t);
-  g.gain.exponentialRampToValueAtTime(0.001, t + 0.03);
-  src.connect(filter); filter.connect(g); g.connect(bgmGain);
-  src.start(t); src.stop(t + 0.04);
+  return false;
 }
